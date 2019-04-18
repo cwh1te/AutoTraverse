@@ -22,12 +22,12 @@ default_config = {
 		"Specify a path to save things to",
 		str, "", True
 	],
-	"-depth" : [
+	"depth" : [
 		"Maximum depth of directories to traverse (0 for infinite).",
 		"Specify a search depth to stop at",
 		int, False, False
 	],
-	"-chunksize" : [
+	"chunksize" : [
 		"Chunk size for writing to disk (default is 4096).",
 		"Specify a custom chunk size",
 		int, 4096, False
