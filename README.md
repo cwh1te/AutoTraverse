@@ -1,7 +1,7 @@
 # AutoTraverse
-A simple tool to traverse web directories and download all the files contained in them.
-
-Options to download files in a flat structure and auto-expand archives and compressed files.
+Simple tool to traverse web directories and download all files contained in them.
+		
+Options to auto-expand archives and compressed files.
 
 Setup:
 ```bash
