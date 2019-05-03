@@ -1,4 +1,11 @@
-import requests, os, argparse, textwrap, yaml, progressbar
+import requests
+import os
+import argparse
+import textwrap
+import yaml
+import progressbar
+import json
+import hashlib
 from bs4 import BeautifulSoup
 
 # Default config with help and stuff
@@ -32,6 +39,16 @@ default_config = {
 		"Specify a custom chunk size",
 		int, 4096, False
 	],
+	"peeksize" : [
+		"How many bytes of a file to read to determine its uniqueness.",
+		"Specify a minimum number of bytes to read to determine file uniqueness (default is 32768)",
+		int, 32768, False
+	],
+	"peekpct" : [
+		"Percentage of a file to read to determine its uniqueness.",
+		"What is the minimum percentage of a file that should be evaluated for uniqueness (default is 2)?",
+		int, 2, False
+	],
 	"--expand" : [
 		"Automatically expand archives and compressed files.",
 		"Do you want to expand archives?",
@@ -52,6 +69,16 @@ default_config = {
 		"Do you want to save this configuration as the default?\nYou can edit or delete settings.yml later.",
 		bool, False, False
 	],
+	"--assume-unchanged" : [
+		"Make download decisions solely based on filenames and paths.",
+		"Do you want to assume downloaded files will never change?",
+		bool, True, False
+	],
+	"--delete-superceded" : [
+		"Delete files if a newer copy has been downloaded.",
+		"Do you want to remove old copies of files?",
+		bool, True, False
+	],
 }
 
 # Populate argument parser
@@ -59,7 +86,7 @@ parser = argparse.ArgumentParser(
 	prog="AutoTraverse",
 	formatter_class=argparse.RawDescriptionHelpFormatter,
 	description=textwrap.dedent("""\
-		AutoTraverse v0.3a
+		AutoTraverse v0.4a
 		  by Caleb White
 		   
 		Simple tool to traverse web directories and download all files contained in them.
@@ -157,19 +184,13 @@ if config == default_config:
 			option_value = None
 			while type(option_value) is not default_config[option][2]:
 				if default_config[option][2] == bool:
-					option_value = input("{0} {1}: ".format(
-						default_config[option][1],
-						"[Y]/[n]" if default_config[option][3] else "[y]/[N]"
-					))
+					option_value = input(f"{default_config[option][1]} {'[Y]/[n]' if default_config[option][3] else '[y]/[N]'}: ")
 					if option_value == "":
 						option_value = default_config[option][3]
 					else:
 						option_value = True if option_value[0] in ["y", "Y"] else False
 				else:
-					option_value = input("{0}{1}: ".format(
-						default_config[option][1],
-						" (blank to skip)" if not default_config[option][4] else ""
-					))
+					option_value = input(f"{default_config[option][1]}{' (blank to skip)' if not default_config[option][4] else ''}: ")
 					if option_value == "" and not default_config[option][4]:
 						break
 				if option_value == "" and default_config[option][4]:
@@ -192,17 +213,18 @@ for option in [x for x in config.keys()]:
 
 # Final checks and input normalizing
 if not config["url"] or not config["path"]:
-	print("You must specify a URL and a path. Run {} -h for details.".format(os.path.basename(__file__)))
+	print("You must specify a URL and a path.",
+		f"Run {os.path.basename(__file__)} -h for details.")
 	exit(1)
 if not config["url"][-1] == "/":
-	config["url"] = "{}/".format(config["url"])
+	config["url"] = f"{config['url']}/"
 if "http://" not in config["url"] and "https://" not in config["url"]:
-	config["url"] = "{}{}".format("https://", config["url"])
+	config["url"] = f"https://{config['url']}"
 if not os.path.isdir(config["path"]):
 	try:
 		os.makedirs(config["path"])
 	except:
-		print("Path does not exist and failed to create it: {0}".format(config["path"]))
+		print(f"Path does not exist and failed to create it: {config['path']}")
 		exit(1)
 
 # Write config if requested
@@ -212,7 +234,7 @@ if config["write-config"]:
 
 # Build Traverse class
 class Traverse(object):
-	def __init__(self, config, *args, **kwargs):
+	def __init__(self, config: dict, *args, **kwargs):
 		self.base_depth = config["url"].count("/") -3
 		config["depth"] += self.base_depth
 		self.config = config
@@ -225,6 +247,7 @@ class Traverse(object):
 			print("WARNING! Archives will be expanded automatically. This combination of options should only be used with trusted sources!")
 
 		self.manifest_file = os.path.join(config["path"], ".manifest")
+		self.manifest = []
 		self.cur_depth = 0
 
 		if config["skip-cert-check"]:
@@ -232,23 +255,33 @@ class Traverse(object):
 
 		try:
 			with open(self.manifest_file, "r") as f:
-				self.manifest = f.readlines()
+				self.manifest = f.read() or []
+				try:
+					if self.manifest:
+						if self.manifest[0] != "[":
+							self.manifest = f"[{self.manifest[:-1]}]"
+						self.manifest = json.loads(self.manifest)
+				except:
+					print(f"Corrupted manifest: {self.manifest_file}")
+					exit(1)
 		except:
 			f = open(self.manifest_file, "w")
 			f.close()
-			self.manifest = []
+		
 
-	def traverse(self, branch = ""):
+	def traverse(self, branch: str = "") -> bool:
 		if branch == "":
-			print("Loading {0}".format(self.config["url"]))
+			print(f"Loading {self.config['url']}")
 		page = requests.get(
-			"{}{}".format(self.config["url"], branch),
+			f"{self.config['url']}{branch}",
 			headers=self.headers,
 			verify=not self.config["skip-cert-check"]
 		)
 		if not page.ok:
-			print("Bad response ({0}) getting directory {1}".format(page.status_code, branch))
-			return
+			print(f"Bad response ({page.status_code}) getting directory {branch}")
+			return False
+		
+		seen_files = [x["name"] for x in self.manifest if x["path"] == os.path.join(self.config['path'], branch)]
 		
 		tree = BeautifulSoup(page.text, "html.parser")
 		
@@ -256,7 +289,7 @@ class Traverse(object):
 			node_href = node.get("href")
 			if node_href[0:4] == "http":
 				if not self.config["url"] in node_href:
-					print("Ignoring off-site link: {0}".format(node_href))
+					print(f"Ignoring off-site link: {node_href}")
 					continue
 				if len(node_href) < len(self.config["url"]):
 					continue
@@ -266,91 +299,204 @@ class Traverse(object):
 				# Let's not backtrack
 				if node_href == "../" or node_href in self.config["url"]:
 					continue
-				node = "{}{}".format(branch, node_href)
+				node = f"{branch}{node_href}"
 				if self.config["depth"] not in [False, -1]:
 					if node.count("/") > self.config["depth"]:
 						continue
-				print("{0}Reading {1}".format("Going deeper! " if node.count("/") > self.cur_depth else "", node))
+				print(f"{'Going deeper! ' if node.count('/') > self.cur_depth else ''}Reading {node}")
 				self.cur_depth = node.count("/")
 				self.traverse(node)
 				continue
 			# Make sure we're only following links to leaves at current depth
-			if not (node_href == "{}{}".format(branch, node.contents[0]) or node_href == node.contents[0]):
+			if not (node_href == f"{branch}{node.contents[0]}" or node_href == node.contents[0]):
 				continue
-			if "{}{}\n".format(branch, node_href) in self.manifest:
-				continue
+			if node_href in seen_files:
+				if self.config["assume-unchanged"]:
+					continue
+				file = [x for x in self.manifest if x["source"] == f"{self.config['url']}{branch}{node_href}"][0]
+				match, md5 = self.peek_leaf(branch, node_href, file)
+				if match:
+					continue
+				if self.config["delete-superceded"]:
+					os.remove(os.path.join(file["path"], file["lname"]))
 			self.get_leaf(branch, node_href)
 		
-		f = open(self.manifest_file, "w")
-		f.close()
-		with open(self.manifest_file, "a") as f:
-			for file in self.manifest:
-				f.write(file)
 		if branch == "":
+			f = open(self.manifest_file, "w")
+			f.close()
+			with open(self.manifest_file, "a") as f:
+				for file in self.manifest:
+					f.write(f"{file},")
 			print("Done!")
+			return True
 
-	def get_leaf(self, branch = "", leaf = ""):
-		save_path = os.path.join(self.config["path"], branch)
-		if not os.path.exists(save_path):
-			os.makedirs(save_path)
-		save_as = os.path.join(self.config["path"], branch, leaf)
-		r = requests.get(
-			"{}{}{}".format(self.config["url"], branch, leaf),
+	def get_stream(self, target: str) -> requests.Request:
+		return requests.get(
+			target,
 			headers=self.headers,
 			stream=True,
 			verify=not self.config["skip-cert-check"]
 		)
+
+	def peek_leaf(self, branch: str, leaf: str, file: dict = None) -> (bool, str):
+		"""Downloads some portion of a file and returns the comparison result and MD5 hash."""
+		r = self.get_stream(f"{self.config['url']}{branch}{leaf}")
+		dsize = int(r.headers.get("content-length"))
+		if not r.ok: return True, file["peekhash"] # Continue on error
+		if file:
+			if not file["dsize"] == dsize: return False, file["peekhash"]
+			peeksize = file["peeksize"] if file["peeksize"]	< dsize else dsize
+			peekpct_bytes = (1/file["peekpct"]) * dsize
+			comphash = file["peekhash"]
+		else:
+			peeksize = self.config["peeksize"] if self.config["peeksize"]	< dsize else dsize
+			peekpct_bytes = (1/self.config["peekpct"]) * dsize
+			comphash = ""
+
+		if peekpct_bytes > peeksize: peeksize = peekpct_bytes
+		chunksize = config["chunksize"] if config["chunksize"] < peeksize else peeksize
+		md5 = hashlib.md5()
+		downloaded = 0
+		for chunk in r.iter_content(chunk_size=chunksize):
+			if chunk:
+				downloaded += len(chunk)
+				if downloaded <= dsize:
+					md5.update(chunk)
+				else:
+					break
+		r.close()
+		md5 = md5.hexdigest()
+		return md5 == comphash, md5
+
+	def get_leaf(self, branch: str, leaf: str) -> bool:
+		save_path = os.path.join(self.config["path"], branch)
+		F = DownloadFile(leaf, save_path, f"{self.config['url']}{branch}{leaf}")
+		F.peekpct = self.config["peekpct"]
+		F.peeksize = self.config["peeksize"]
+		dummy, F.peekhash = self.peek_leaf(branch, leaf)
+		if not os.path.exists(save_path):
+			os.makedirs(save_path)
+		r = self.get_stream(f"{self.config['url']}{branch}{leaf}")
 		if not r.ok:
-			print("Bad response ({0}) getting file {1}{2}".format(r.status_code, branch, leaf))
-			return
-		download_size = int(r.headers.get("content-length"))
+			print(f"Bad response ({r.status_code}) getting file {branch}{leaf}")
+			return False
+		F.dsize = int(r.headers.get("content-length"))
 		pbar = progressbar.ProgressBar(
 				widgets=[
-						"Getting file {0}{1}: ".format(branch, leaf),
+						f"Getting file {branch}{leaf}: ",
 						progressbar.Counter(),
-						"/{0} (".format(r.headers.get("content-length")),
+						f"/{F.dsize} (",
 						progressbar.Percentage(),
 						") ",
 						progressbar.Bar(),
 						progressbar.AdaptiveETA()
-				], maxval=download_size
+				], maxval=F.dsize
 		).start()
 		downloaded = 0
-		with open(save_as, 'wb') as f:
+		with open(os.path.join(save_path, F.lname), 'wb') as f:
 			for chunk in r.iter_content(chunk_size=self.config["chunksize"]):
 				if chunk:
-					chunk_size = len(chunk)
-					downloaded += chunk_size
-					if downloaded <= download_size:
+					downloaded += len(chunk)
+					if downloaded <= F.dsize:
 						pbar.update(downloaded)
 					else:
-						pbar.update(download_size)
-						print("\nWarning: Exceeded advertised size! {0} > {1}".format(downloaded, download_size))
+						pbar.update(F.dsize)
+						print(f"\nWarning: Exceeded advertised size! {downloaded} > {F.dsize}")
 					f.write(chunk)
 				else:
 					pbar.update(int(r.headers.get("content-length")))
+		F.saved = True
 		pbar.finish()
 		print()
 		# Append to manifest
-		self.manifest.append("{0}{1}\n".format(branch, leaf))
+		self.manifest.append(F.__repr__())
 		# Write to disk to prevent lost information from early termination
 		with open(self.manifest_file, "a") as f:
-				f.write(self.manifest[-1])
+				f.write(f"{F},")
 		if self.config["expand"]:
-			self.extract_file(save_as)
+			F.extract()
 
-	def extract_file(self, file, loop=True):
+class DownloadFile(object):
+	def __init__(self, name: str, path: str, source: str, *args, **kwargs):
+		self.name = name
+		self.path = path
+		self.source = source
+		self.peeksize = 0
+		self.peekpct = 0
+		self.nopeek = True
+		self.peekhash = ""
+		self.dsize = 0
+		self.saved = False
+		self._lname = ""
+	
+	def __repr__(self) -> dict:
+		return {
+			"name" : self.name,
+			"path" : self.path,
+			"source" : self.source,
+			"peeksize" : self.peeksize,
+			"peekpct" : self.peekpct,
+			"peekhash" : self.peekhash,
+			"dsize" : self.dsize,
+			"lname" : self.lname,
+		}
+	
+	def __str__(self) -> str:#JSON
+		return json.dumps(self.__repr__())
+
+	@property
+	def lname(self) -> str:#filename
+		"""The local file name if saved, otherwise a dynamically generated candidate."""
+		if not self.saved or not self._lname:
+			self._lname = self.get_unique_fname(self.path, self.name)
+		return self._lname
+	
+	@property
+	def lsize(self) -> int:#bytes
+		"""The size of the file if saved, otherwise 0."""
+		return os.path.getsize(os.path.join(self.path, self.lname)) if self.saved else 0
+
+	def get_unique_fname(self, filepath: str, filename: str) -> str:
+		"""Returns a unique (non-pre-existing) filename for a given filename and path."""
+		basename, ext = self.get_fext(filename)
+		i = 0
+		while os.path.exists(os.path.join(filepath, f"{basename} ({i}){ext}" if i else filename)):
+			i += 1
+		return f"{basename} ({i}){ext}" if i else filename
+
+	def get_fext(self, filename: str, extlim: int = -1) -> (str, str):
+		"""
+			Returns a name and extension parts for a given filename.
+
+			Basically os.path.splitext() except recursive.
+
+			Parameters:
+				filename (str): The filename to split
+				extlim (int): Limit the number of characters to evaluate as potential extensions
+		"""
+		ext = ""
+		# Avoid infinite recursion
+		if extlim >= len(filename): extlim = -1
+		while "." in filename[-extlim:]:
+			filename, ext2 = os.path.splitext(filename)
+			# Avoid infinite recursion
+			if not ext2: break
+			ext = ext2 + ext
+		return filename, ext
+
+	def extract(self, file: str = "", loop: bool = True) -> bool:
 		import zipfile, gzip, tarfile, shutil
 
 		out_files = []
-		file = str(file)
+		if not file:
+			file = self.lname
 		f_base, f_ext = os.path.splitext(file)
 
 		# ZIP archives
 		if f_ext == ".zip":
-			print("Expanding ZIP archive {0}.".format(file))
+			print(f"Expanding ZIP archive {file}.")
 			try:
-				with zipfile.ZipFile(os.path.join(self.config["path"], file)) as zip:
+				with zipfile.ZipFile(os.path.join(self.path, file)) as zip:
 					# testzip() returns None or name of first bad file
 					if zipfile.ZipFile.testzip(zip) is not None:
 						print("Malformed ZIP or contents corrupted! Unable to process.")
@@ -358,52 +504,52 @@ class Traverse(object):
 					if self.config["flat"]:
 						# Not using extractall() because we don't want a tree structure
 						for member in zip.infolist():
-							member = self.unique_fname(member)
+							member = self.get_unique_fname(self.path, member)
 							if self.config["flat"]:
-								zip.extract(member, self.config["path"])
+								zip.extract(member, self.path)
 							else:
 								zip.extract(member)
 							out_files.append(str(member))
 					else:
-						zip.extractall(self.config["path"])
+						zip.extractall(self.path)
 					# Delete the zip file now that we have its contents
-				os.remove(os.path.join(self.config["path"], file))
+				os.remove(os.path.join(self.path, file))
 			except:
-				print("Unable to expand ZIP archive {0}. You should check its headers or something.".format(file))
+				print(f"Unable to expand ZIP archive {file}. You should check its headers or something.")
 				return False
 
 		# GZIP compression
 		elif f_ext == ".gz":
-			print("Expanding GZIP compressed file {0}.".format(file))
+			print(f"Expanding GZIP compressed file {file}.")
 			try:
-				out_fname = self.unique_fname(f_base)
-				with gzip.open(os.path.join(self.config["path"], file), "rb") as f_in, open(os.path.join(self.config["path"], out_fname), "wb") as f_out:
+				out_fname = self.get_unique_fname(self.path, f_base)
+				with gzip.open(os.path.join(self.path, file), "rb") as f_in, open(os.path.join(self.path, out_fname), "wb") as f_out:
 					shutil.copyfileobj(f_in, f_out)
 				out_files.append(out_fname)
 				# Delete the gz file now that we have its contents
-				os.remove(os.path.join(self.config["path"], file))
+				os.remove(os.path.join(self.path, file))
 			except:
-				print("Unable to expand GZIP file {0}. It's likely malformed.".format(file))
+				print(f"Unable to expand GZIP file {file}. It's likely malformed.")
 				return False
 
 		# TAR archives
 		elif f_ext == ".tar":
-			print("Expanding TAR archive {0}.".format(file))
+			print(f"Expanding TAR archive {file}.")
 			try:
-				with tarfile.open(os.path.join(self.config["path"], file), "r") as tar:
+				with tarfile.open(os.path.join(self.path, file), "r") as tar:
 					if self.config["flat"]:
 						# Not using extractall() because we don't want a tree structure
 						for member in tar.getmembers():
 							if member.isreg():
 								if self.config["flat"]:
 									# Strip any path information from members
-									member.name = self.unique_fname(os.path.basename(member.name))
-								tar.extract(member, self.config["path"])
+									member.name = self.get_unique_fname(self.path, os.path.basename(member.name))
+								tar.extract(member, self.path)
 								out_files.append(member.name)
 				# Delete the tar file now that we have its contents
-				os.remove(os.path.join(self.config["path"], file))
+				os.remove(os.path.join(self.path, file))
 			except:
-				print("Unable to expand TAR archive {0}. Something is wrong with it.".format(file))
+				print(f"Unable to expand TAR archive {file}. Something is wrong with it.")
 		
 		# The file is not compressed or archived, or not a supported format
 		else:
@@ -415,27 +561,14 @@ class Traverse(object):
 		# Iterate back through, in case of layered archives or compressed archives (e.g. example.tar.gz)
 		for file in out_files:
 			# Set loop switch to False to avoid creating blackhole
-			self.extract_file(file, False)
-		
-		
-	def unique_fname(self, file):
-		# Rename file if necessary to avoid overwrite...
-		basename, ext = self.get_fext(str(file))
-		i = 0
-		while os.path.exists(os.path.join(self.config["path"], "{0} ({1}){2}".format(basename, i, ext) if i else file)):
-			i += 1
-		# Apply the filename determined by the previous step
-		if i:
-			file = "{0} ({1}){2}".format(basename, i, ext)
-		return file
-
-	def get_fext(self, file):
-		basename, ext = os.path.splitext(file)
-		while "." in basename[-6:]:
-			basename, ext2 = os.path.splitext(basename)
-			ext = ext2 + ext
-		return basename, ext
+			self.extract(file, False)
 	
 if __name__ == "__main__":
-	t = Traverse(config)
-	t.traverse()
+	try:
+		t = Traverse(config)
+		t.traverse()
+	except KeyboardInterrupt:
+		print("\nReceived keyboard interrupt. Bye!")
+	except:
+		print("Hrmm... something went wrong.")
+		raise
