@@ -12,9 +12,12 @@ Requires Python 3.7.3+ for proper operation. Please don't open issues for old Py
 ## Usage:
 ```bash
 python AutoTraverse.py url path [depth] [chunksize] [peeksize] [peekpct] [-h] [--expand] [--flat]
-                    [--skip-cert-check] [--write-config] [--assume-unchanged] [--delete-superceded]
+                    [--skip-cert-check] [--assume-unchanged] [--delete-superceded] [--write-config]
+                    [--progressbar]
 ```
 You can also run it with no arguments and the initial configuration wizard will help you figure things out.
+
+Note: In order to use the `--progressbar` flag, you will have to `pip install progressbar` separately. This is because the package is from Google and therefore many people might not trust is, so I didn't feel good having it in `requirements.txt`.
 
 ## Examples:
 ```
