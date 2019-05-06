@@ -435,8 +435,6 @@ class Traverse(object):
       if self.config["delete-superceded"]:
         F._lname = manifest_file._lname
         F.saved = True # Locks in the file's local name
-    print(F.peekhash)
-    print(peek_hash)
     os.rename(os.path.join(save_path, F.lname + '.part'), os.path.join(save_path, F.lname))
     F.saved = True
       
