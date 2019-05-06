@@ -90,7 +90,7 @@ parser = argparse.ArgumentParser(
   prog="AutoTraverse",
   formatter_class=argparse.RawDescriptionHelpFormatter,
   description=textwrap.dedent("""\
-    AutoTraverse v0.4.1a
+    AutoTraverse v0.4.2a
       by Caleb White
        
     Simple tool to traverse web directories and download all files contained in them.
@@ -323,24 +323,12 @@ class Traverse(object):
       # Make sure we're only following links to leaves at current depth
       if not (node_href == f"{branch}{node.contents[0]}" or node_href == node.contents[0]):
         continue
-      md5 = ""
+      manfile = None
       if node_href in seen_files:
         if self.config["assume-unchanged"]:
           continue
-        # Check for early byte hash differences
         manfile = [x for x in self.manifest if x.source == f"{self.config['url']}{branch}{node_href}"][0]
-        peekfile = self.peek_leaf(branch, node_href, manfile)
-        md5 = peekfile.peekhash
-        if peekfile.peekhash == manfile.peekhash:
-          continue
-        # Rebuild manifest without the superceded file
-        self.manifest = [x for x in self.manifest if x.peekhash != manfile.peekhash and x.source != f"{self.config['url']}{branch}{node_href}"]
-        if self.config["delete-superceded"]:
-          try:
-            os.remove(os.path.join(manfile.path, manfile.lname))
-          except:
-            print(f"Failed deleting superceded file {os.path.join(manfile.path, manfile.lname)}")
-      self.get_leaf(branch, node_href, md5)
+      self.get_leaf(branch, node_href, manfile)
     
     if branch == "":
       f = open(self.manifest_file, "w")
@@ -359,65 +347,45 @@ class Traverse(object):
       verify=not self.config["skip-cert-check"]
     )
 
-  def peek_leaf(self, branch: str, leaf: str, dlfile: 'DownloadFile' = None) -> 'DownloadFile':
-    """Downloads some portion of a file and returns the comparison result and MD5 hash."""
-    r = self.get_stream(f"{self.config['url']}{branch}{leaf}")
-    dsize = int(r.headers.get('content-length'))
-    if not r.ok: return DownloadFile() # Continue on error
-    if dlfile:
-      peekfile = DownloadFile(dlfile.__dict__)
-      if not dlfile.dsize == dsize: return dlfile
-      peekfile.peeksize = dlfile.peeksize if dlfile.peeksize < dsize else dsize
-      peekpct_bytes = (1/dlfile.peekpct) * dsize
-    else:
-      peekfile = DownloadFile({
-        'peekpct' : self.config['peekpct'],
-        'peeksize' : self.config['peeksize'] if self.config['peeksize'] < dsize else dsize
-      })
-      peekpct_bytes = (1/self.config['peekpct']) * dsize
-    peekfile.dsize = dsize
-
-    if peekpct_bytes > peekfile.peeksize: peekfile.peeksize = peekpct_bytes
-    chunksize = self.config['chunksize'] if self.config['chunksize'] < peekfile.peeksize else peekfile.peeksize
-    peekfile.peekhash = hashlib.md5()
-    downloaded = 0
-    for chunk in r.iter_content(chunk_size=chunksize):
-      if chunk:
-        downloaded += len(chunk)
-        if downloaded <= peekfile.dsize:
-          peekfile.peekhash.update(chunk)
-        else:
-          break
-    r.close()
-    peekfile.peekhash = peekfile.peekhash.hexdigest()
-    return peekfile
-
-  def get_leaf(self, branch: str, leaf: str, peekhash: str = "") -> bool:
+  def get_leaf(self, branch: str, leaf: str, manifest_file: 'DownloadFile' = None) -> bool:
     save_path = os.path.join(self.config['path'], branch)
-    if not peekhash:
-      F = self.peek_leaf(branch, leaf)
-      F.name = leaf
-      F.path = save_path
-      F.source = f"{self.config['url']}{branch}{leaf}"
-    else:
-      F = DownloadFile({
-        'name' : leaf,
-        'path' : save_path,
-        'source' : f"{self.config['url']}{branch}{leaf}",
-        'peekpct' : self.config['peekpct'],
-        'peeksize' : self.config['peeksize'],
-        'peekhash' : peekhash,
-      })
+    F = DownloadFile({
+      'name' : leaf,
+      'path' : save_path,
+      'source' : f"{self.config['url']}{branch}{leaf}",
+      'peekpct' : self.config['peekpct'],
+      'peeksize' : self.config['peeksize'],
+    })
+
     if not os.path.exists(save_path):
       os.makedirs(save_path)
+
     r = self.get_stream(F.source)
     if not r.ok:
       print(f"Bad response ({r.status_code}) getting file {branch}{leaf}")
       return False
-    elif not F.dsize:
-      F.dsize = int(r.headers.get('content-length'))
+
+    F.dsize = int(r.headers.get('content-length'))
+
+    F.peekhash = hashlib.md5()
+    if manifest_file and F.dsize == manifest_file.dsize and not self.config["assume-unchanged"]:
+      F.peekpct = manifest_file.peekpct
+      F.peeksize = manifest_file.peeksize
+      peek_bytes = F.peeksize
+      peek_hash = manifest_file.peekhash
+    else:
+      peek_bytes = int(F.peekpct * F.dsize / 100)
+      if peek_bytes < F.peeksize:
+        peek_bytes = F.peeksize
+      if peek_bytes > F.dsize:
+        peek_bytes = F.dsize
+      peek_hash = ""
+    peek_remainder = peek_bytes % self.config["chunksize"]
+    F.peeksize = peek_bytes
+
     pbar = None
     if self.config['progressbar']:
+      print()
       # Initialize progressbar
       pbar = progressbar.ProgressBar(
         widgets=[
@@ -432,27 +400,46 @@ class Traverse(object):
       ).start()
     else:
       print(f"Getting file {branch}{leaf} ({F.dsize } bytes)...")
+
     # Get the file
     downloaded = 0
-    with open(os.path.join(save_path, F.lname), 'wb') as f:
+    with open(os.path.join(save_path, F.lname + '.part'), 'wb') as f:
       for chunk in r.iter_content(chunk_size=self.config["chunksize"]):
-        if chunk:
-          downloaded += len(chunk)
-          if downloaded <= F.dsize:
-            if pbar:
-              pbar.update(downloaded)
-          else:
-            print(f"\nWarning: Exceeded advertised size! {downloaded} > {F.dsize}")
-            if pbar:
-              pbar.update(F.dsize)
-          f.write(chunk)
-        else:
+        downloaded += len(chunk)
+        if downloaded <= F.dsize:
           if pbar:
-            pbar.update(int(r.headers.get("content-length")))
-    F.saved = True
+            pbar.update(downloaded)
+        else:
+          print(f"\nWarning: Exceeded advertised size! {downloaded} > {F.dsize}")
+          if pbar:
+            pbar.update(F.dsize)
+        if downloaded <= F.peeksize - (peek_remainder):
+          F.peekhash.update(chunk)
+        elif downloaded == F.peeksize + (self.config["chunksize"] - peek_remainder):
+          F.peekhash.update(chunk[0:peek_remainder])
+        else:
+          if not type(F.peekhash) == str:
+            F.peekhash = F.peekhash.hexdigest()
+            if F.peekhash == peek_hash:
+              print("\nFile appears unchanged. Moving on...")
+              r.close()
+              os.remove(os.path.join(save_path, F.lname + '.part'))
+              return True
+        f.write(chunk)
+      r.close()
     if pbar:
       pbar.finish()
-      print()
+    if manifest_file:
+      # Rebuild manifest without the superceded file
+      self.manifest = [x for x in self.manifest if not (x.peekhash == peek_hash and x.source == F.source)]
+      if self.config["delete-superceded"]:
+        F._lname = manifest_file._lname
+        F.saved = True # Locks in the file's local name
+    print(F.peekhash)
+    print(peek_hash)
+    os.rename(os.path.join(save_path, F.lname + '.part'), os.path.join(save_path, F.lname))
+    F.saved = True
+      
     # Append to manifest
     self.manifest.append(F)
     # Write to disk to prevent lost information from early termination
